@@ -7,6 +7,19 @@ import tempfile
 import sqlite3
 from datetime import datetime
 try:
+    import requests
+    from bs4 import BeautifulSoup
+except Exception:
+    try:
+        import sys, subprocess
+        with st.spinner('Installing web scraping dependencies (requests, beautifulsoup4)...'):
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'requests', 'beautifulsoup4'])
+        import requests
+        from bs4 import BeautifulSoup
+    except Exception:
+        requests = None
+        BeautifulSoup = None
+try:
     import plotly.express as px
     from streamlit_plotly_events import plotly_events
 except Exception:
@@ -293,6 +306,51 @@ def build_review_graph(df: pd.DataFrame):
                 else:
                     graph.add_edge(a, b, weight=1, product=str(product_id))
     return graph
+
+def scrape_reviews(url: str) -> pd.DataFrame:
+    if requests is None or BeautifulSoup is None:
+        raise RuntimeError('Scraping libraries are not available')
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; ReviewAnalyzer/1.0)'}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        reviews = []
+        # Heuristic selectors (may vary per site)
+        review_blocks = soup.select('[data-review], .review, .a-section.review, .review-card, .review-item')
+        if not review_blocks:
+            review_blocks = soup.find_all(['article', 'div'], class_=lambda c: c and 'review' in str(c).lower())
+        for block in review_blocks:
+            text_el = block.find(['p', 'span', 'div'], class_=lambda c: c and ('content' in str(c).lower() or 'text' in str(c).lower())) or block.find('p')
+            text = text_el.get_text(strip=True) if text_el else ''
+            # Star patterns
+            star = None
+            star_el = block.find(['i', 'span', 'div'], attrs={'aria-label': True})
+            if star_el and star_el.get('aria-label'):
+                import re
+                m = re.search(r"(\d+(?:\.\d+)?)\s*out of\s*5", star_el.get('aria-label'), re.I)
+                if m:
+                    try:
+                        star = int(round(float(m.group(1))))
+                    except Exception:
+                        pass
+            if star is None:
+                possible = block.find_all(text=True)
+                for t in possible:
+                    s = str(t)
+                    if 'out of 5' in s:
+                        try:
+                            val = float(s.split('out of 5')[0].strip().split()[-1])
+                            star = int(round(val))
+                            break
+                        except Exception:
+                            continue
+            if text:
+                reviews.append({'review_text': text, 'star_rating': int(star) if star is not None else 3})
+        return pd.DataFrame(reviews)
+    except Exception as e:
+        st.info(f'Unable to scrape reviews: {e}')
+        return pd.DataFrame(columns=['review_text', 'star_rating'])
 
 def map_rating_to_sentiment(star_rating):
     if star_rating in (4, 5):
@@ -620,6 +678,134 @@ if uploaded_file is not None:
                     except Exception as e:
                         st.info(f'Unable to generate fraud graph: {e}')
 
+            # Campaign Anomaly Detection
+            st.header("Campaign Anomaly Detection")
+            try:
+                # Temporal patterns by hour
+                if 'timestamp' in df.columns:
+                    try:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+                    except Exception:
+                        pass
+                if 'timestamp' in df.columns and pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+                    hourly = df.dropna(subset=['timestamp']).copy()
+                    hourly['hour'] = hourly['timestamp'].dt.hour
+                    st.subheader('Reviews by Hour of Day')
+                    if px is not None:
+                        fig_hour = px.bar(hourly.groupby('hour').size().reset_index(name='count'), x='hour', y='count', title='Hourly Review Volume (All Products)')
+                        st.plotly_chart(fig_hour, use_container_width=True)
+                    else:
+                        st.bar_chart(hourly.groupby('hour').size())
+
+                # Geo patterns map
+                st.subheader('Geographic Patterns')
+                if 'author_location' in df.columns:
+                    # Expect columns lat, lon if available, else skip plotting
+                    lat_lon_cols = {'lat', 'latitude', 'lon', 'lng', 'longitude'}
+                    has_lat = any(col in df.columns for col in ['lat', 'latitude'])
+                    has_lon = any(col in df.columns for col in ['lon', 'lng', 'longitude'])
+                    if has_lat and has_lon:
+                        prod_options = sorted(results_df['product_id'].astype(str).unique().tolist()) if 'product_id' in results_df.columns else []
+                        selected_prod = st.selectbox('Select product to map', prod_options) if prod_options else None
+                        map_df = results_df.copy()
+                        if selected_prod is not None:
+                            map_df = map_df[map_df['product_id'].astype(str) == selected_prod]
+                        # Rename to lat/lon if necessary
+                        if 'latitude' in df.columns and 'lat' not in df.columns:
+                            df = df.rename(columns={'latitude': 'lat'})
+                        if 'longitude' in df.columns and 'lon' not in df.columns:
+                            df = df.rename(columns={'longitude': 'lon'})
+                        if 'lng' in df.columns and 'lon' not in df.columns:
+                            df = df.rename(columns={'lng': 'lon'})
+                        if {'lat', 'lon'}.issubset(df.columns):
+                            st.map(df[['lat', 'lon']].dropna())
+                    else:
+                        st.info('Location coordinates not found. Provide lat/lon columns to enable the map.')
+
+                # Burst score per product
+                st.subheader('Burst Scores by Product')
+                if 'timestamp' in df.columns and 'product_id' in results_df.columns:
+                    tmp = results_df.copy()
+                    if 'timestamp' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+                        try:
+                            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+                        except Exception:
+                            pass
+                    # Join timestamps from original df if results_df lacks it
+                    if 'timestamp' not in results_df.columns:
+                        tmp = tmp.merge(df[['review_text', 'timestamp']], on='review_text', how='left')
+                    tmp = tmp.dropna(subset=['timestamp']).copy()
+                    tmp['hour_bucket'] = tmp['timestamp'].dt.floor('H')
+                    burst = (tmp.groupby(['product_id', 'hour_bucket'])
+                               .size()
+                               .reset_index(name='count'))
+                    burst_scores = burst.groupby('product_id')['count'].max().reset_index(name='burst_score')
+                    burst_scores = burst_scores.sort_values('burst_score', ascending=False)
+                    st.dataframe(burst_scores)
+            except Exception as e:
+                st.info(f'Unable to compute anomaly detection: {e}')
+
+            # Competitive Intelligence
+            st.header('Competitive Intelligence')
+            comp_url = st.text_input('Paste competitor product URL')
+            if comp_url:
+                if st.button('Scrape and Analyze'):
+                    comp_df = scrape_reviews(comp_url)
+                    if not comp_df.empty:
+                        st.write('Scraped Reviews Preview:')
+                        st.dataframe(comp_df.head(20))
+                        # Reuse the batch pipeline on scraped data with minimal columns
+                        # Add placeholders for required fields
+                        comp_df['date'] = pd.Timestamp.utcnow().normalize()
+                        comp_df['author_id'] = 'unknown'
+                        comp_df['product_id'] = 'competitor'
+                        # Process as if uploaded
+                        st.write('Running analysis on scraped data...')
+                        # Minimal reuse: iterate and compute
+                        comp_results = []
+                        for _, row in comp_df.iterrows():
+                            review_text = str(row['review_text'])
+                            try:
+                                star_rating = int(row['star_rating'])
+                            except Exception:
+                                star_rating = 3
+                            text_sentiment, confidence_score = analyze_text_sentiment_with_score(classifier, review_text)
+                            rating_sentiment = map_rating_to_sentiment(star_rating)
+                            base_mismatch = ((text_sentiment == 'POSITIVE' and rating_sentiment == 'NEGATIVE') or
+                                             (text_sentiment == 'NEGATIVE' and rating_sentiment == 'POSITIVE'))
+                            comp_results.append({
+                                'review_text': review_text,
+                                'star_rating': star_rating,
+                                'date': row['date'],
+                                'author_id': row['author_id'],
+                                'product_id': row['product_id'],
+                                'text_sentiment': text_sentiment,
+                                'rating_sentiment': rating_sentiment,
+                                'confidence_score': float(confidence_score),
+                                'is_mismatch': bool(base_mismatch),
+                                'ai_probability': is_ai_generated(review_text),
+                                'topic': None,
+                            })
+                        comp_results_df = pd.DataFrame(comp_results)
+                        st.session_state['results_df_competitor'] = comp_results_df.copy()
+                        st.dataframe(comp_results_df)
+                        # Basic topic classification on mismatches
+                        try:
+                            comp_mismatch = comp_results_df[comp_results_df['is_mismatch'] == True]
+                            if not comp_mismatch.empty:
+                                topics = []
+                                for text in comp_mismatch['review_text'].tolist():
+                                    try:
+                                        z = zero_shot_classifier(text, candidate_labels)
+                                        topics.append(z.get('labels', ['Unknown'])[0] if isinstance(z, dict) else 'Unknown')
+                                    except Exception:
+                                        topics.append('Unknown')
+                                comp_mismatch = comp_mismatch.copy()
+                                comp_mismatch['topic'] = topics
+                                st.subheader('Competitor: Top Topics in Mismatches')
+                                st.dataframe(comp_mismatch['topic'].value_counts().reset_index().rename(columns={'index': 'topic', 'topic': 'count'}))
+                        except Exception:
+                            pass
     # Admin / Model Training Section
     st.header('Model Training')
     col_a, col_b = st.columns(2)
