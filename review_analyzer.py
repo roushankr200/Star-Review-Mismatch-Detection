@@ -1,6 +1,11 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import numpy as np
+import time
+import os
+import tempfile
+import sqlite3
+from datetime import datetime
 try:
     import plotly.express as px
     from streamlit_plotly_events import plotly_events
@@ -14,9 +19,88 @@ except Exception:
     except Exception:
         px = None
         plotly_events = None
+
+try:
+    import networkx as nx
+except Exception:
+    try:
+        import sys, subprocess
+        with st.spinner('Installing graph dependency (networkx)...'):
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'networkx'])
+        import networkx as nx
+    except Exception:
+        nx = None
+
+try:
+    from pyvis.network import Network
+except Exception:
+    try:
+        import sys, subprocess
+        with st.spinner('Installing visualization dependency (pyvis)...'):
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'pyvis'])
+        from pyvis.network import Network
+    except Exception:
+        Network = None
 import pandas as pd
 
 st.title("Star-Review Mismatch Detector")
+
+if 'moderation_queue' not in st.session_state:
+    st.session_state['moderation_queue'] = []
+
+@st.cache_resource
+def init_feedback_db(db_path: str = 'moderator_feedback.db'):
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            review_text TEXT,
+            text_sentiment TEXT,
+            rating_sentiment TEXT,
+            confidence_score REAL,
+            ai_probability REAL,
+            suspicion_score REAL,
+            author_id TEXT,
+            product_id TEXT,
+            decision TEXT
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+def log_moderation_feedback(conn: sqlite3.Connection, item: dict, decision: str):
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO feedback (
+                timestamp, review_text, text_sentiment, rating_sentiment,
+                confidence_score, ai_probability, suspicion_score,
+                author_id, product_id, decision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.utcnow().isoformat(),
+                item.get('review_text'),
+                item.get('text_sentiment'),
+                item.get('rating_sentiment'),
+                float(item.get('confidence_score', 0.0)) if item.get('confidence_score') is not None else None,
+                float(item.get('ai_probability', 0.0)) if item.get('ai_probability') is not None else None,
+                float(item.get('suspicion_score', 0.0)) if item.get('suspicion_score') is not None else None,
+                str(item.get('author_id')) if item.get('author_id') is not None else None,
+                str(item.get('product_id')) if item.get('product_id') is not None else None,
+                decision
+            )
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+feedback_conn = init_feedback_db()
 
 @st.cache_resource
 def load_model():
@@ -72,6 +156,23 @@ def load_sarcasm_model():
     return pipeline('text-classification', model='helinivan/english-sarcasm-detector')
 
 sarcasm_classifier = load_sarcasm_model()
+
+@st.cache_resource
+def load_ai_text_detector():
+    try:
+        from transformers import pipeline
+    except Exception:
+        try:
+            import sys, subprocess
+            with st.spinner('Installing missing dependencies (transformers/torch)...'):
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'transformers', 'torch'])
+            from transformers import pipeline
+        except Exception as e:
+            st.error("Missing dependency: transformers/torch. Install with 'pip install -r requirements.txt'.\nDetails: {}".format(e))
+            st.stop()
+    return pipeline('text-classification', model='roberta-base-openai-detector')
+
+ai_text_detector = load_ai_text_detector()
 
 def analyze_text_sentiment(classifier, text):
     result = classifier(text)
@@ -141,6 +242,58 @@ def detect_sarcasm(text, threshold: float = 0.7) -> bool:
         pass
     return False
 
+def is_ai_generated(text: str) -> float:
+    try:
+        result = ai_text_detector(text)
+        if isinstance(result, list) and len(result) > 0:
+            label = str(result[0].get('label', '')).upper()
+            score = float(result[0].get('score', 0.0))
+            is_ai_label = ('FAKE' in label) or ('AI' in label) or ('AI-GENERATED' in label)
+            return float(score if is_ai_label else 1.0 - score)
+    except Exception:
+        pass
+    return 0.0
+
+def calculate_suspicion_score(review_data: dict) -> float:
+    sentiment_weight = 0.5
+    ai_weight = 0.3
+    sarcasm_weight = -0.2
+
+    sentiment_confidence = float(review_data.get('sentiment_confidence', 0.0))
+    ai_probability = float(review_data.get('ai_probability', 0.0))
+    sarcasm_score = float(review_data.get('sarcasm_score', 0.0))
+
+    raw_score = (
+        sentiment_confidence * sentiment_weight +
+        ai_probability * ai_weight +
+        sarcasm_score * sarcasm_weight
+    )
+    # Normalize to [0, 100]
+    normalized = max(0.0, min(1.0, raw_score)) * 100.0
+    return float(normalized)
+
+def build_review_graph(df: pd.DataFrame):
+    if nx is None:
+        raise RuntimeError('networkx is not available')
+    graph = nx.Graph()
+    # Ensure only necessary columns
+    sub = df[['author_id', 'product_id']].dropna()
+    # Add nodes for authors
+    for author in sub['author_id'].unique():
+        graph.add_node(str(author))
+    # For each product, fully connect authors who reviewed it
+    for product_id, group in sub.groupby('product_id'):
+        authors = list({str(a) for a in group['author_id'].tolist()})
+        for i in range(len(authors)):
+            for j in range(i + 1, len(authors)):
+                a, b = authors[i], authors[j]
+                if graph.has_edge(a, b):
+                    # Increment weight for multiple co-reviews
+                    graph[a][b]['weight'] = graph[a][b].get('weight', 1) + 1
+                else:
+                    graph.add_edge(a, b, weight=1, product=str(product_id))
+    return graph
+
 def map_rating_to_sentiment(star_rating):
     if star_rating in (4, 5):
         return 'POSITIVE'
@@ -172,18 +325,31 @@ if st.button('Analyze Review'):
 
         st.write('Text Sentiment:', text_sentiment)
         st.write('Star Rating Sentiment:', rating_sentiment)
+        ai_prob = is_ai_generated(review_input)
+        st.metric(label='AI-Generated Probability', value=f"{ai_prob*100:.1f}%")
+        if ai_prob >= 0.80:
+            st.warning('High likelihood of AI-generated text detected.')
+
+        sarcasm_flag = detect_sarcasm(review_input)
+        sarcasm_score = 1.0 if sarcasm_flag else 0.0
+        sentiment_conf_for_score = confidence_score if base_mismatch else 0.0
+        suspicion_score = calculate_suspicion_score({
+            'sentiment_confidence': sentiment_conf_for_score,
+            'ai_probability': ai_prob,
+            'sarcasm_score': sarcasm_score,
+        })
+        st.metric(label='Suspicion Score', value=f"{suspicion_score:.0f}/100")
 
         if base_mismatch and confidence_score > confidence_threshold:
-            st.warning(f'⚠️ Mismatch Detected with {confidence_score:.2%} confidence!')
             shap_html = explain_sentiment(review_input)
             components.html(shap_html, height=200)
-            if detect_sarcasm(review_input):
+            if sarcasm_flag:
                 st.info('ℹ️ Mismatch detected, but sarcasm may be a factor. Manual review recommended.')
         elif base_mismatch and confidence_score <= confidence_threshold:
             st.info('A potential mismatch was detected, but it is below your confidence threshold.')
             shap_html = explain_sentiment(review_input)
             components.html(shap_html, height=200)
-            if detect_sarcasm(review_input):
+            if sarcasm_flag:
                 st.info('ℹ️ Mismatch detected, but sarcasm may be a factor. Manual review recommended.')
         else:
             st.success('✅ No mismatch detected!')
@@ -201,9 +367,9 @@ if uploaded_file is not None:
         st.error(f'Failed to read CSV: {read_error}')
         st.stop()
 
-    required_columns = {'review_text', 'star_rating', 'date', 'author_id'}
+    required_columns = {'review_text', 'star_rating', 'date', 'author_id', 'product_id'}
     if not required_columns.issubset(df.columns):
-        st.error("CSV must contain columns: 'review_text', 'star_rating', 'date', and 'author_id'.")
+        st.error("CSV must contain columns: 'review_text', 'star_rating', 'date', 'author_id', and 'product_id'.")
     else:
         # Normalize date column early
         try:
@@ -225,6 +391,9 @@ if uploaded_file is not None:
             author_id = row.get('author_id')
             if pd.isna(author_id):
                 continue
+            product_id = row.get('product_id')
+            if pd.isna(product_id):
+                continue
 
             text_sentiment, confidence_score = analyze_text_sentiment_with_score(classifier, review_text)
             rating_sentiment = map_rating_to_sentiment(star_rating)
@@ -238,10 +407,17 @@ if uploaded_file is not None:
                 'star_rating': star_rating,
                 'date': date_value,
                 'author_id': author_id,
+                'product_id': product_id,
                 'text_sentiment': text_sentiment,
                 'rating_sentiment': rating_sentiment,
                 'confidence_score': float(confidence_score),
                 'is_mismatch': bool(base_mismatch),
+                'ai_probability': is_ai_generated(review_text),
+                'suspicion_score': calculate_suspicion_score({
+                    'sentiment_confidence': float(confidence_score) if base_mismatch else 0.0,
+                    'ai_probability': is_ai_generated(review_text),
+                    'sarcasm_score': 1.0 if detect_sarcasm(review_text) else 0.0,
+                }),
             })
 
         if results:
@@ -325,6 +501,145 @@ if uploaded_file is not None:
             except Exception as e:
                 st.info(f'Unable to compute author stats: {e}')
 
+            # Product Level Analysis
+            st.header('Product Level Analysis')
+            try:
+                by_product = (results_df
+                              .groupby('product_id')
+                              .agg(total_reviews=('review_text', 'count'),
+                                   mismatches=('is_mismatch', 'sum')))
+                by_product['mismatch_rate'] = by_product['mismatches'] / by_product['total_reviews']
+                by_product_sorted = by_product.sort_values(['mismatch_rate', 'total_reviews'], ascending=[False, False])
+                st.dataframe(by_product_sorted.reset_index())
+
+                product_options = by_product_sorted.index.astype(str).tolist()
+                selected_products = st.multiselect('Select products to inspect', product_options)
+                if selected_products:
+                    filtered_full = results_df[results_df['product_id'].astype(str).isin(selected_products)]
+                    st.dataframe(filtered_full)
+            except Exception as e:
+                st.info(f'Unable to compute product stats: {e}')
+
+            # Live Moderation Queue Simulation
+            st.subheader('Live Moderation Queue Simulation')
+            simulate_live = st.toggle('Simulate Live Review Feed')
+            if simulate_live:
+                try:
+                    # Stream in one new mismatched review per rerun
+                    for _, row in mismatches_df.iterrows():
+                        key = f"{row.get('author_id')}|{row.get('product_id')}|{row.get('date')}|{row.get('review_text')[:50]}"
+                        existing_keys = {item.get('key') for item in st.session_state['moderation_queue']}
+                        if key not in existing_keys:
+                            st.session_state['moderation_queue'].append({
+                                'key': key,
+                                'review_text': row.get('review_text'),
+                                'star_rating': int(row.get('star_rating')) if pd.notna(row.get('star_rating')) else None,
+                                'text_sentiment': row.get('text_sentiment'),
+                                'rating_sentiment': row.get('rating_sentiment'),
+                                'confidence_score': float(row.get('confidence_score', 0.0)),
+                                'ai_probability': float(row.get('ai_probability', 0.0)),
+                                'author_id': row.get('author_id'),
+                                'product_id': row.get('product_id'),
+                                'date': row.get('date')
+                            })
+                            time.sleep(2)
+                            st.rerun()
+                            break
+                except Exception as e:
+                    st.info(f'Unable to stream live reviews: {e}')
+
+            # Display Moderation Queue
+            if st.session_state['moderation_queue']:
+                st.subheader('Moderation Queue')
+                for idx, item in enumerate(list(st.session_state['moderation_queue'])):
+                    with st.expander(item.get('review_text', 'Review')):
+                        st.write({'author_id': item.get('author_id'),
+                                  'product_id': item.get('product_id'),
+                                  'date': item.get('date'),
+                                  'star_rating': item.get('star_rating'),
+                                  'text_sentiment': item.get('text_sentiment'),
+                                  'rating_sentiment': item.get('rating_sentiment'),
+                                  'confidence_score': item.get('confidence_score'),
+                                  'ai_probability': item.get('ai_probability')})
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button('Approve', key=f"approve_{item['key']}"):
+                                try:
+                                    log_moderation_feedback(feedback_conn, item, 'Approved')
+                                finally:
+                                    st.session_state['moderation_queue'].pop(idx)
+                                    st.rerun()
+                        with col2:
+                            if st.button('Reject', key=f"reject_{item['key']}"):
+                                try:
+                                    log_moderation_feedback(feedback_conn, item, 'Rejected')
+                                finally:
+                                    st.session_state['moderation_queue'].pop(idx)
+                                    st.rerun()
+
+            # Fraud Ring Detection
+            st.header("Fraud Ring Detection")
+            if Network is None or nx is None:
+                st.info('Graph libraries not available. Try rerunning to auto-install dependencies.')
+            else:
+                if st.button('Generate Fraud Network Graph'):
+                    try:
+                        graph = build_review_graph(results_df)
+                        communities = list(nx.algorithms.community.greedy_modularity_communities(graph))
+
+                        # Build pyvis network
+                        net = Network(height='600px', width='100%', bgcolor='#ffffff', font_color='#333333', notebook=False, directed=False)
+                        # Assign community colors
+                        community_map = {}
+                        for idx_c, comm in enumerate(communities):
+                            for node in comm:
+                                community_map[node] = idx_c
+                        for node in graph.nodes():
+                            color_idx = community_map.get(node, -1)
+                            color = px.colors.qualitative.Plotly[color_idx % len(px.colors.qualitative.Plotly)] if (px is not None and color_idx >= 0) else None
+                            net.add_node(node, label=node, color=color)
+                        for u, v, data in graph.edges(data=True):
+                            net.add_edge(u, v, value=data.get('weight', 1))
+
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            html_path = os.path.join(tmpdir, 'fraud_network.html')
+                            net.show(html_path)
+                            with open(html_path, 'r', encoding='utf-8') as f:
+                                html_content = f.read()
+                            components.html(html_content, height=650, scrolling=True)
+
+                        # Display communities table
+                        comm_rows = []
+                        for idx_c, comm in enumerate(communities):
+                            comm_rows.append({'community_id': idx_c, 'authors': sorted(list(comm))})
+                        if comm_rows:
+                            comm_df = pd.DataFrame(comm_rows)
+                            st.dataframe(comm_df)
+                        else:
+                            st.info('No communities detected.')
+                    except Exception as e:
+                        st.info(f'Unable to generate fraud graph: {e}')
+
+    # Admin / Model Training Section
+    st.header('Model Training')
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button('Export Training Data'):
+            try:
+                cur = feedback_conn.cursor()
+                cur.execute('SELECT timestamp, review_text, text_sentiment, rating_sentiment, confidence_score, ai_probability, suspicion_score, author_id, product_id, decision FROM feedback')
+                rows = cur.fetchall()
+                export_df = pd.DataFrame(rows, columns=['timestamp', 'review_text', 'text_sentiment', 'rating_sentiment', 'confidence_score', 'ai_probability', 'suspicion_score', 'author_id', 'product_id', 'decision'])
+                if not export_df.empty:
+                    csv_bytes = export_df.to_csv(index=False).encode('utf-8')
+                    st.download_button('Download Labeled Data CSV', data=csv_bytes, file_name='moderator_feedback_export.csv', mime='text/csv')
+                else:
+                    st.info('No feedback data available yet.')
+            except Exception as e:
+                st.info(f'Unable to export training data: {e}')
+    with col_b:
+        if st.button('Fine-tune Model'):
+            st.info('Fine-tuning job triggered. In a production setup, this would call a training script with the exported data.')
             csv_data = results_df.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label='Download Results as CSV',
