@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 
 st.title("Star-Review Mismatch Detector")
 
@@ -57,4 +58,53 @@ if st.button('Analyze Review'):
             st.success('✅ No mismatch detected!')
     else:
         st.warning('Please enter review text before analyzing.')
+
+st.subheader('Batch Processing')
+
+uploaded_file = st.file_uploader('Upload a CSV file', type=['csv'])
+
+if uploaded_file is not None:
+    try:
+        df = pd.read_csv(uploaded_file)
+    except Exception as read_error:
+        st.error(f'Failed to read CSV: {read_error}')
+        st.stop()
+
+    required_columns = {'review_text', 'star_rating'}
+    if not required_columns.issubset(df.columns):
+        st.error("CSV must contain columns: 'review_text' and 'star_rating'.")
+    else:
+        results = []
+        for _, row in df.iterrows():
+            review_text = str(row['review_text'])
+            try:
+                star_rating = int(row['star_rating'])
+            except Exception:
+                # If conversion fails, mark as NaN-like and skip this row
+                continue
+
+            is_mismatch, text_sentiment, rating_sentiment = detect_mismatch(
+                classifier, review_text, star_rating
+            )
+            results.append({
+                'review_text': review_text,
+                'star_rating': star_rating,
+                'text_sentiment': text_sentiment,
+                'rating_sentiment': rating_sentiment,
+                'is_mismatch': is_mismatch,
+            })
+
+        if results:
+            results_df = pd.DataFrame(results)
+            st.dataframe(results_df)
+
+            csv_data = results_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label='Download Results as CSV',
+                data=csv_data,
+                file_name='mismatch_results.csv',
+                mime='text/csv'
+            )
+        else:
+            st.warning('No valid rows to process in the uploaded CSV.')
 
