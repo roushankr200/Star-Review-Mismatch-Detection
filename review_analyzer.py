@@ -30,3 +30,20 @@ def detect_mismatch(classifier, review_text, star_rating):
     )
     return is_mismatch, text_sentiment, rating_sentiment
 
+st.subheader('Enter a review and its star rating to check for mismatches.')
+
+review_input = st.text_area('Review Text')
+star_input = st.slider('Star Rating', 1, 5, 3)
+
+if st.button('Analyze Review'):
+    if review_input.strip():
+        is_mismatch, text_sentiment, rating_sentiment = detect_mismatch(classifier, review_input, star_input)
+        st.write('Text Sentiment:', text_sentiment)
+        st.write('Star Rating Sentiment:', rating_sentiment)
+        if is_mismatch:
+            st.warning('⚠️ Mismatch Detected!')
+        else:
+            st.success('✅ No mismatch detected!')
+    else:
+        st.warning('Please enter review text before analyzing.')
+
