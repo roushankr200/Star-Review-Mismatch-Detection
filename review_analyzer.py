@@ -7,8 +7,15 @@ def load_model():
     try:
         from transformers import pipeline
     except Exception as import_error:
-        st.error("Missing dependency: transformers/torch. Install with 'pip install -r requirements.txt'.\nDetails: {}".format(import_error))
-        st.stop()
+        # Attempt a one-time inline install (useful on fresh deployments)
+        try:
+            import sys, subprocess
+            with st.spinner('Installing missing dependencies (transformers/torch)...'):
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'transformers', 'torch'])
+            from transformers import pipeline  # retry after install
+        except Exception as retry_error:
+            st.error("Missing dependency: transformers/torch. Install with 'pip install -r requirements.txt'.\nDetails: {}".format(retry_error))
+            st.stop()
     return pipeline('sentiment-analysis')
 
 classifier = load_model()
