@@ -1,10 +1,14 @@
 import streamlit as st
-from transformers import pipeline
 
 st.title("Star-Review Mismatch Detector")
 
 @st.cache_resource
 def load_model():
+    try:
+        from transformers import pipeline
+    except Exception as import_error:
+        st.error("Missing dependency: transformers/torch. Install with 'pip install -r requirements.txt'.\nDetails: {}".format(import_error))
+        st.stop()
     return pipeline('sentiment-analysis')
 
 classifier = load_model()
